@@ -940,7 +940,7 @@ def main():
     st.markdown(f"""
     <div class="hero">
         <h1>{APP_ICON} {APP_TITLE}</h1>
-        <p>Base de vacaciones 365 días · Comparación contra SAP · Colores JMC · Guacamaya</p>
+        <p>Base de vacaciones 365 días · Comparación contra SAP</p>
     </div>
     """, unsafe_allow_html=True)
     st.markdown("""
