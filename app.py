@@ -3,10 +3,12 @@
 Auditor Nómina Part Time - JMC
 Creado por Andrés Huérfano Dávila – Nómina JMC
 
-Versión v5
+Versión v6.1
 - Módulo 1: base promedio y pago esperado de vacaciones Part Time.
 - Módulo 2: comparación contra prenómina SAP.
 - AUSNOM acumulado: se usa sobre la ventana de 365 días, no solo el mes.
+- v6: evita duplicar columnas de MD cuando AUSNOM ya venía normalizado.
+- v6.1: filtra el MD a ZH/ZP y deja cruces de mes como observación informativa, no como error.
 - Histórico de salarios PT: respaldo oficial cuando no hay salario pagado en acumulados.
 - Calendario interno Colombia.
 - ZH/ZP con reglas diferenciales.
@@ -420,6 +422,8 @@ def prepare_md(df: pd.DataFrame) -> pd.DataFrame:
     out["CECO"] = df[ceco_col].astype(str) if ceco_col else ""
     out["Cargo"] = df[cargo_col].astype(str) if cargo_col else ""
     out = out[out["SAP"].str.len() > 0].drop_duplicates("SAP", keep="last")
+    # La app es exclusiva para Part Time; si el MD viene general, dejamos solo ZH/ZP.
+    out = out[out["Grupo área"].isin(["ZH", "ZP"])].copy()
     return out
 
 
@@ -645,11 +649,26 @@ def build_vacation_base(
     aus = aus_acum.copy()
     if md is not None and not md.empty:
         # Reforzar área con MD cuando AUSNOM no la traiga.
-        aus = aus.merge(md[["SAP", "Grupo área", "Nombre MD"]].rename(columns={"Grupo área": "Grupo área MD"}), on="SAP", how="left")
-        aus["Grupo área"] = np.where(aus["Grupo área"].eq("NO_IDENTIFICADA"), aus["Grupo área MD"].fillna("NO_IDENTIFICADA"), aus["Grupo área"])
-        aus["Nombre base"] = aus.get("Nombre MD", "").fillna(aus.get("Nombre Ausnom", ""))
+        # prepare_ausnom() ya puede traer Grupo área MD/Nombre MD; evitamos duplicar columnas.
+        if "Grupo área MD" not in aus.columns:
+            aus = aus.merge(
+                md[["SAP", "Grupo área"]].rename(columns={"Grupo área": "Grupo área MD"}),
+                on="SAP", how="left"
+            )
+        if "Nombre MD" not in aus.columns:
+            aus = aus.merge(md[["SAP", "Nombre MD"]], on="SAP", how="left")
+        if "Grupo área MD" in aus.columns:
+            aus["Grupo área"] = np.where(
+                aus["Grupo área"].eq("NO_IDENTIFICADA"),
+                aus["Grupo área MD"].fillna("NO_IDENTIFICADA"),
+                aus["Grupo área"]
+            )
+        nombre_md = aus["Nombre MD"] if "Nombre MD" in aus.columns else pd.Series("", index=aus.index)
+        nombre_aus = aus["Nombre Ausnom"] if "Nombre Ausnom" in aus.columns else pd.Series("", index=aus.index)
+        aus["Nombre base"] = nombre_md.fillna("").astype(str)
+        aus["Nombre base"] = np.where(aus["Nombre base"].str.strip().ne(""), aus["Nombre base"], nombre_aus.fillna("").astype(str))
     else:
-        aus["Nombre base"] = aus.get("Nombre Ausnom", "")
+        aus["Nombre base"] = aus["Nombre Ausnom"] if "Nombre Ausnom" in aus.columns else ""
 
     vacation_rows = aus[(aus["Familia ausencia"] == "VACACIONES") & aus.apply(lambda r: overlap(r["Fecha inicio"], r["Fecha fin"], period_start, period_end), axis=1)].copy()
 
@@ -728,15 +747,17 @@ def build_vacation_base(
         base_365 = base_salario_pagado + base_variable + valor_aus_total
         valor_diario_vac = base_365 / 365 if base_365 else 0.0
         valor_vac_esperado = valor_diario_vac * dias_vac_mes
-        obs = []
+        obs_error = []
+        obs_info = []
         if area not in ["ZH", "ZP"]:
-            obs.append("Área no identificada como ZH/ZP")
+            obs_error.append("Área no identificada como ZH/ZP")
         if base_365 <= 0:
-            obs.append("Base 365 en cero; revisar acumulados/histórico")
+            obs_error.append("Base 365 en cero; revisar acumulados/histórico")
         if dias_vac_mes <= 0:
-            obs.append("Vacación sin días calculados en el mes revisado")
+            obs_error.append("Vacación sin días calculados en el mes revisado")
         if nota_vac:
-            obs.append(nota_vac)
+            obs_info.append(nota_vac)
+        obs = obs_error + obs_info
         base_rows.append({
             "SAP": sap, "Nombre": nombre, "Área": area,
             "Vacación inicio": vac_start, "Vacación fin": vac_end,
@@ -751,7 +772,7 @@ def build_vacation_base(
             "Promedio mensual": base_365 / 365 * 30 if base_365 else 0.0,
             "Valor diario vacaciones": valor_diario_vac,
             "Valor vacaciones esperado": valor_vac_esperado,
-            "Estado": "REVISAR" if obs else "OK",
+            "Estado": "REVISAR" if obs_error else "OK",
             "Observación": "; ".join(obs) if obs else "OK",
         })
 
@@ -769,7 +790,8 @@ def prepare_monthly_absences(aus: pd.DataFrame, md: pd.DataFrame, year: int, mon
     period_end = date(year, month, calendar.monthrange(year, month)[1])
     out = aus[aus.apply(lambda r: overlap(r["Fecha inicio"], r["Fecha fin"], period_start, period_end), axis=1)].copy()
     if md is not None and not md.empty:
-        out = out.merge(md[["SAP", "Grupo área"]].rename(columns={"Grupo área":"Grupo área MD"}), on="SAP", how="left")
+        if "Grupo área MD" not in out.columns:
+            out = out.merge(md[["SAP", "Grupo área"]].rename(columns={"Grupo área":"Grupo área MD"}), on="SAP", how="left")
         out["Grupo área"] = np.where(out["Grupo área"].eq("NO_IDENTIFICADA"), out["Grupo área MD"].fillna("NO_IDENTIFICADA"), out["Grupo área"])
     calc = out.apply(lambda r: date_counts_for_rule(r["Familia ausencia"], r["Grupo área"], r["Fecha inicio"], r["Fecha fin"], period_start, period_end), axis=1)
     out["Días calculados app"] = [x[0] for x in calc]
@@ -918,7 +940,7 @@ def main():
     st.markdown(f"""
     <div class="hero">
         <h1>{APP_ICON} {APP_TITLE}</h1>
-        <p>Base de vacaciones 365 días · Comparación contra SAP </p>
+        <p>Base de vacaciones 365 días · Comparación contra SAP · Colores JMC · Guacamaya</p>
     </div>
     """, unsafe_allow_html=True)
     st.markdown("""
